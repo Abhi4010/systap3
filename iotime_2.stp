@@ -1,0 +1,316 @@
+#! /usr/bin/env stap
+
+global start
+global time_io
+
+
+# Get time spent so far
+function timestamp:long() { return gettimeofday_us() - start }
+
+# print process id, process name
+function proc:string() { return sprintf("PID: %d  ExecName: (%s)", pid(), execname()) }
+
+
+probe begin {
+ start = gettimeofday_us() 
+ }
+
+
+probe timer.s(60)
+{
+  exit()
+}
+
+
+global possible_filename, filehandles, fileread, filewrite, show_all_steps = 0,failed_showing = 0
+
+probe syscall.open, syscall.openat {
+  possible_filename[tid()] = filename
+ }
+
+
+probe syscall.open.return, syscall.openat.return {
+
+  #Clear file entry
+  filename = possible_filename[tid()]
+  delete  possible_filename[tid()]
+  if (returnval() > 0) {
+    filehandles[pid(), returnval()] = filename
+    if(show_all_steps == 1)
+      printf("TimeNow:: %d syscall.open.return called. filehandle entry added for (pid,filename) (%d,%s)\n",timestamp(),pid(),filename)
+  } else {
+    
+    if(failed_showing == 1)
+    printf("  %s file access Failed %s fail\n", proc(), filename)
+  }
+}
+
+global read_fds, write_fds
+probe syscall.read {
+ read_fds[tid()] = fd 
+
+ }
+ 
+probe syscall.read.return {
+  p = pid()
+  fd = read_fds[tid()]
+  delete read_fds[tid()]
+  bytes =  returnval()
+  time = gettimeofday_us() - @entry(gettimeofday_us())
+  if (bytes > 0)
+    fileread[p, fd] <<< bytes
+  time_io[p, fd] <<< time
+ if(execname() == "filebench")
+     printf(" systemcall write return lala lala pid:%d  execname:%s   bytes:%d\n",pid(),execname(), bytes);
+
+}
+
+probe syscall.write { write_fds[tid()] = fd }
+
+probe syscall.write.return {
+  p = pid()
+  // Get fd even if non-dwarf syscall return probe.
+  fd = write_fds[tid()]
+  delete write_fds[tid()]
+  bytes =  returnval()
+  time = gettimeofday_us() - @entry(gettimeofday_us())
+  if (bytes > 0)
+    filewrite[p, fd] <<< bytes
+  time_io[p, fd] <<< time
+
+   if(execname() == "filebench")
+   printf(" systemcall write return lala lala pid:%d  execname:%s   bytes:%d\n filename:%s\n ",pid(),execname(), bytes,filehandles[pid(),fd]);
+}
+
+ 
+global filename_to_read_io_count, filename_to_write_io_count
+global filename_to_read_byte_count,filename_to_write_byte_count
+global filename_to_total_read_operation_count
+global filename_to_total_write_operation_count
+global offset_handle
+global filename_to_byte_position_access_count
+global read_chunk_count,total_sequential_read,total_sequential_read_byte_count,temp_last,total_read_count_per_read
+global temp_tracker
+
+
+probe end{
+
+  process_not_closed_files()
+
+  printf("\n\n\n..............................File Read Summery............................\n\n\n")
+  foreach ([filename] in filename_to_read_byte_count){
+    printf("File: %s  SizeB: %d  IOTime: %d  IOTimePerKB: %d\n",filename, filename_to_read_byte_count[filename], filename_to_read_io_count[filename], (filename_to_read_io_count[filename]* 1024)/filename_to_read_byte_count[filename])
+  }
+
+  printf("\n\n\n..............................File Read count............................\n\n\n")
+
+  foreach ([filename] in filename_to_total_read_operation_count){
+  printf("File: %s  NoOfTimesRead: %d \n",filename,filename_to_total_read_operation_count[filename])
+
+  }
+
+  printf("\n\n\n..............................Write Summery............................\n\n\n")
+
+  foreach ([filename] in filename_to_write_byte_count)
+    printf("File: %s  SizeB: %d  IOTime: %d  IOTimePerKB: %d\n", filename, filename_to_write_byte_count[filename], filename_to_write_io_count[filename], (filename_to_write_io_count[filename]* 1024/filename_to_write_byte_count[filename]))
+
+
+   printf("\n\n\n..............................File Write count............................\n\n\n")
+
+  foreach ([filename] in filename_to_total_write_operation_count){
+  printf("File: %s  NoOfTimesWritten: %d \n",filename,filename_to_total_write_operation_count[filename])
+
+  }  
+}
+
+probe syscall.close {
+  if ([pid(), fd] in filehandles)
+   {
+     printf("Time: %d %s File: %s  read: %d bytes  write: %d bytes  ",
+           timestamp(), proc(), filehandles[pid(), fd],
+           @sum(fileread[pid(), fd]), @sum(filewrite[pid(), fd]))
+                temp =  @sum(fileread[pid(), fd])
+
+                //IF READ DONE
+                if(temp ){
+                filename_to_read_byte_count[filehandles[pid(), fd]] += temp
+                if (@count(time_io[pid(), fd])){
+                    temp =  @sum(time_io[pid(), fd])
+                      filename_to_read_io_count[filehandles[pid(), fd]] += temp
+                   }
+                filename_to_total_read_operation_count[filehandles[pid(), fd]] += 1
+                if(offset_handle[pid(),fd]){
+                  read_count = @sum(fileread[pid(), fd])
+                  off_set_position = offset_handle[pid(),fd] 
+                  filename_to_byte_position_access_count[filehandles[pid(), fd],off_set_position,read_count] +=1                                 }
+                }
+
+                temp =  @sum(filewrite[pid(), fd])
+                //IF WRITE DONE
+                if(temp  ){
+                filename_to_write_byte_count[filehandles[pid(), fd]] += temp
+                if (@count(time_io[pid(), fd])){
+                    temp =  @sum(time_io[pid(), fd])
+                      filename_to_write_io_count[filehandles[pid(), fd]] += temp
+                   }
+                   filename_to_total_write_operation_count[filehandles[pid(), fd]] += 1
+                }
+
+        
+            
+    if (@count(time_io[pid(), fd]))
+      printf("IOTime: %d\n", @sum(time_io[pid(), fd]))
+      
+       foreach ([pidd,fdd,rv] in read_chunk_count){
+       if(pidd == pid() && fdd == fd ){
+         printf("VFSReadSize:%d  VFSReadCount:%d  \n",rv,read_chunk_count[pidd,fdd,rv])
+         temp_tracker[rv] = rv
+
+        }
+       }
+      
+       if(total_sequential_read[pid(),fd])
+       printf("VFSSequencialRead: %d  ",total_sequential_read[pid(),fd])
+       if(total_sequential_read_byte_count[pid(),fd])
+        printf("ByteSequentiallyRead: %d  ",total_sequential_read_byte_count[pid(),fd])
+      if(total_read_count_per_read[pid(),fd])
+        printf("TotalVFSReadSize:%d  ",total_read_count_per_read[pid(),fd]) 
+      printf("\n\n")                 
+   }
+  delete fileread[pid(), fd]
+  delete filewrite[pid(), fd]
+  delete filehandles[pid(), fd]
+  delete time_io[pid(),fd]
+  delete offset_handle[pid(),fd]
+  delete total_sequential_read[pid(),fd]
+  delete total_sequential_read_byte_count[pid(),fd]
+  delete temp_last[pid(),fd]
+  delete total_read_count_per_read[pid(),fd]
+
+     foreach ([rv] in temp_tracker){
+         delete read_chunk_count[pid(),fd,temp_tracker[rv]]
+ }
+            
+        delete temp_tracker    
+
+}
+
+probe vfs.read{
+
+//  offset = $pos
+ // count = $count
+
+//printf("Vfs read processid: %d   offset: %d count:%d\n",pid(), kernel_long(offset),count)
+  
+}
+
+
+//global read_chunk_count,total_sequential_read,total_sequential_read_byte_count,temp_last,total_read_count_per_read
+probe vfs.read.return{
+
+ fd = read_fds[tid()]
+// foreach ([pid, fd] in filehandles)
+//    printf("For each pid:%d  fd:%d\n",pid,fd)
+ offset = @entry($pos)
+offset_handle[pid(),fd] = kernel_long(offset)
+read_chunk_count[pid(),fd,returnval()]++
+
+if(temp_last[pid(),fd]){
+  previous = kernel_long(offset) - returnval()
+  if( previous == temp_last[pid(),fd]){
+    total_sequential_read[pid(),fd]++
+    total_sequential_read_byte_count[pid(),fd] += returnval()
+  }
+}
+temp_last[pid(),fd] = kernel_long(offset)
+total_read_count_per_read[pid(),fd]++
+
+if(execname() == "filebench")
+ printf("Vfs read  return   processid: %d  ExecName: %s offset: %d count:%d\n",pid(), execname(),kernel_long(offset),returnval())
+}
+
+probe vfs.write.return{
+  offset = @entry($pos)
+  if(execname() == "filebench")
+ printf("Vfs write  return   processid: %d  ExecName: %s offset: %d count:%d\n",pid(), execname(),kernel_long(offset),returnval())
+}
+
+
+
+
+
+function process_not_closed_files() {
+
+printf("\n\n processing unclosed files\n\n")
+foreach ([pid,fd] in filehandles){
+  
+       printf("Time: %d %s File: %s  read: %d bytes  write: %d bytes  ",
+           timestamp(), proc(), filehandles[pid, fd],
+           @sum(fileread[pid, fd]), @sum(filewrite[pid, fd]))
+                temp =  @sum(fileread[pid, fd])
+
+                //IF READ DONE
+                if(temp ){
+                filename_to_read_byte_count[filehandles[pid, fd]] += temp
+                if (@count(time_io[pid, fd])){
+                    temp =  @sum(time_io[pid, fd])
+                      filename_to_read_io_count[filehandles[pid, fd]] += temp
+                   }
+                filename_to_total_read_operation_count[filehandles[pid, fd]] += 1
+                if(offset_handle[pid,fd]){
+                  read_count = @sum(fileread[pid, fd])
+                  off_set_position = offset_handle[pid,fd] 
+                  filename_to_byte_position_access_count[filehandles[pid, fd],off_set_position,read_count] +=1                                 }
+                }
+
+                temp =  @sum(filewrite[pid, fd])
+                //IF WRITE DONE
+                if(temp){
+                filename_to_write_byte_count[filehandles[pid, fd]] += temp
+                if (@count(time_io[pid, fd])){
+                    temp =  @sum(time_io[pid, fd])
+                      filename_to_write_io_count[filehandles[pid, fd]] += temp
+                   }
+                   filename_to_total_write_operation_count[filehandles[pid, fd]] += 1
+                }
+
+        
+            
+    if (@count(time_io[pid, fd]))
+      printf("IOTime: %d\n", @sum(time_io[pid, fd]))
+      
+       foreach ([pidd,fdd,rv] in read_chunk_count){
+       if(pidd == pid && fdd == fd ){
+         printf("VFSReadSize:%d  VFSReadCount:%d  \n",rv,read_chunk_count[pidd,fdd,rv])
+         temp_tracker[rv] = rv
+
+        }
+       }
+      
+       if(total_sequential_read[pid,fd])
+       printf("VFSSequencialRead: %d  ",total_sequential_read[pid,fd])
+       if(total_sequential_read_byte_count[pid,fd])
+        printf("ByteSequentiallyRead: %d  ",total_sequential_read_byte_count[pid(),fd])
+      if(total_read_count_per_read[pid,fd])
+        printf("TotalVFSReadSize:%d  ",total_read_count_per_read[pid(),fd]) 
+      printf("\n\n")                 
+   }
+  delete fileread[pid, fd]
+  delete filewrite[pid, fd]
+  delete filehandles[pid, fd]
+  delete time_io[pid,fd]
+  delete offset_handle[pid,fd]
+  delete total_sequential_read[pid,fd]
+  delete total_sequential_read_byte_count[pid,fd]
+  delete temp_last[pid,fd]
+  delete total_read_count_per_read[pid,fd]
+
+     foreach ([rv] in temp_tracker){
+         delete read_chunk_count[pid,fd,temp_tracker[rv]]
+ }
+            
+        delete temp_tracker  
+        return ""
+  }
+
+
